@@ -54,14 +54,14 @@ def getFolderPoseHandler(posePath):
 
 class DataMap(object):
     '''
-    New base class for handling data
+    New base class for handling data storage and reloading with intelligence
     '''
     
     def __init__(self, filterSettings=None, *args, **kws):
         '''
         The idea of the DataMap is to make the node handling part of any system generic.
         This allows us to use this baseClass to build up things like poseSavers and all
-        we have to worry about is the data extraction part, all the node handling
+        we have to worry about is the data save / extraction part, all the node handling
         and file handling is already done by this class ;)
         
         Note that we're not passing any data in terms of nodes here, We'll deal with
@@ -70,8 +70,8 @@ class DataMap(object):
         self.poseDict={}
         self.infoDict={}
         self.skeletonDict={}
-        self.file_ext = ''
-        self.filepath=''
+        self.file_ext = ''  # extension the file will be saved as
+        self.filepath=''    # path to load / save
         self.__filepath = ''
         self.mayaUpAxis = r9Setup.mayaUpAxis()
         self.thumbnailRes=[128,128]
@@ -80,7 +80,7 @@ class DataMap(object):
         self.metaRig=None  # filled by the code as we process
         self.matchMethod='base'  # method used to match nodes internally in the poseDict
         self.useFilter=True
-        self.prioritySnapOnly=False
+        self.prioritySnapOnly=False  # mainly used by any load relative calls, determines whether to use the internal filters priority list
         self.skipAttrs=[]  # attrs to completely ignore in any pose handling
         
         # make sure we have a settings object
@@ -114,13 +114,28 @@ class DataMap(object):
             self.__filepath='%s%s' % (os.path.splitext(path)[0], self.file_ext)
         else:
             self.__filepath=path
-        
-    def setMetaRig(self,node):
-        log.info('setting internal metaRig from given node : %s' % node)
+    
+    def _pre_load(self):
+        '''
+        called directly before the loadData call so you have access
+        to manage the undoQueue etc if subclassing
+        '''
+        pass
+    
+    def _post_load(self):
+        '''
+        called directly after the loadData call so you have access
+        to manage the undoQueue etc if subclassing
+        '''
+        pass
+           
+    def setMetaRig(self, node):
+        log.debug('setting internal metaRig from given node : %s' % node)
         if r9Meta.isMetaNodeInherited(node,'MetaRig'):
             self.metaRig=r9Meta.MetaClass(node)
         else:
             self.metaRig=r9Meta.getConnectedMetaSystemRoot(node)
+        log.debug('setting internal metaRig : %s' % self.metaRig)
         return self.metaRig
     
     def hasFolderOverload(self):
@@ -264,7 +279,9 @@ class DataMap(object):
                 self.poseDict[key]['mirrorID']=mirrorID  # add the mirrorIndex
             if self.metaPose:
                 self.poseDict[key]['metaData']=getMetaDict(node)  # metaSystem the node is wired too
-
+            
+            # the above blocks are the generic info used to map the data on load
+            # this call is the specific collection of data for this node required by this map type
             self._collectNodeData(node, key)
 
     def _buildBlocks_to_run(self, nodes):
@@ -331,55 +348,7 @@ class DataMap(object):
     
     # Data Mapping - Apply the dataMap ------------------------------------------------
 
-    def _matchNodes_to_data(self, nodes):
-        '''
-        pre-loader function that processes all the nodes and data prior to
-        actually calling the load... why? this is for the poseMixer for speed.
-        This reads the file, matches the nodes to the internal file data and fills
-        up the self.matchedPairs data [(src,dest),(src,dest)]
-        
-        ..note:
-            this replaced the original call self._poseLoad_buildcache()
-        '''
-        if not type(nodes)==list:
-            nodes=[nodes]  # cast to list for consistency
-            
-        if self.metaPose:
-            self.setMetaRig(nodes[0])
-            
-        if self.filepath and not os.path.exists(self.filepath):
-            raise StandardError('Given Path does not Exist')
-                
-        if self.filepath and self.hasFolderOverload():  # and useFilter:
-            nodesToLoad = self.getNodesFromFolderConfig(nodes, mode='load')
-        else:
-            nodesToLoad=self.getNodes(nodes)
-        if not nodesToLoad:
-            raise StandardError('Nothing selected or returned by the filter to load the pose onto')
-        
-        if self.filepath:
-            self._readPose(self.filepath)
-            log.info('Pose Read Successfully from : %s' % self.filepath)
 
-        if self.metaPose:
-            if 'metaPose' in self.infoDict and self.metaRig:
-                try:
-                    if eval(self.infoDict['metaPose']):
-                        self.matchMethod = 'metaData'
-                except:
-                    self.matchMethod = 'metaData'
-            else:
-                log.debug('Warning, trying to load a NON metaPose to a MRig - switching to NameMatching')
-        
-        #fill the skip list, these attrs will be totally ignored by the code
-        self.skipAttrs=self.getSkippedAttrs(nodes[0])
-                 
-        #Build the master list of matched nodes that we're going to apply data to
-        #Note: this is built up from matching keys in the poseDict to the given nodes
-        self.matchedPairs = self._matchNodesToPoseData(nodesToLoad)
-        
-        return nodesToLoad
-    
     @r9General.Timer
     def _applyData_attrs(self, *args, **kws):
         '''
@@ -407,7 +376,8 @@ class DataMap(object):
                                             
     def _applyData(self, *args, **kws):
         '''
-        To Be Overloaded
+        To Be Overloaded:
+        Main apply block run after we've read the data and matched all nodes
         '''
         self._applyData_attrs()
                   
@@ -445,13 +415,65 @@ class DataMap(object):
                 raise StandardError('Given filepath doesnt not exist : %s' % filename)
         else:
             raise StandardError('No FilePath given to read the pose from')
-                      
+
+    def processPoseFile(self, nodes):
+        '''
+        pre-loader function that processes all the nodes and data prior to
+        actually calling the load... why? this is for the poseMixer for speed.
+        This reads the file, matches the nodes to the internal file data and fills
+        up the self.matchedPairs data [(src,dest),(src,dest)]
+        
+        ..note:
+            this replaced the original call self._poseLoad_buildcache()
+        '''
+        if not type(nodes)==list:
+            nodes=[nodes]  # cast to list for consistency
+            
+        if self.metaPose:
+            self.setMetaRig(nodes[0])
+            
+        if self.filepath and not os.path.exists(self.filepath):
+            raise StandardError('Given Path does not Exist')
+                
+        if self.filepath and self.hasFolderOverload():  # and useFilter:
+            nodesToLoad = self.getNodesFromFolderConfig(nodes, mode='load')
+        else:
+            nodesToLoad=self.getNodes(nodes)
+        if not nodesToLoad:
+            raise StandardError('Nothing selected or returned by the filter to load the pose onto')
+        
+        if self.filepath:
+            self._readPose(self.filepath)
+            log.info('Pose Read Successfully from : %s' % self.filepath)
+
+        if self.metaPose:
+            print 'infoDict : ', self.infoDict
+            print 'metaRig : ', self.metaRig
+            if 'metaPose' in self.infoDict and self.metaRig:
+                try:
+                    if eval(self.infoDict['metaPose']):
+                        self.matchMethod = 'metaData'
+                except:
+                    self.matchMethod = 'metaData'
+            else:
+                log.debug('Warning, trying to load a NON metaPose to a MRig - switching to NameMatching')
+        
+        #fill the skip list, these attrs will be totally ignored by the code
+        self.skipAttrs=self.getSkippedAttrs(nodes[0])
+                 
+        #Build the master list of matched nodes that we're going to apply data to
+        #Note: this is built up from matching keys in the poseDict to the given nodes
+        self.matchedPairs = self._matchNodesToPoseData(nodesToLoad)
+        
+        return nodesToLoad
+                    
     @r9General.Timer
     def _matchNodesToPoseData(self, nodes):
         '''
         Main filter to extract matching data pairs prior to processing
         return : tuple such that :  (poseDict[key], destinationNode)
         NOTE: I've changed this so that matchMethod is now an internal PoseData attr
+        
         :param nodes: nodes to try and match from the poseDict
         '''
         matchedPairs=[]
@@ -464,7 +486,7 @@ class DataMap(object):
                 for key in self.poseDict.keys():
                     if int(self.poseDict[key]['ID'])==i:
                         matchedPairs.append((key,node))
-                        log.info('poseKey : %s %s >> matchedSource : %s %i' % (key, self.poseDict[key]['ID'], node, i))
+                        log.debug('poseKey : %s %s >> matchedSource : %s %i' % (key, self.poseDict[key]['ID'], node, i))
                         break
         if self.matchMethod=='mirrorIndex':
             getMirrorID=r9Anim.MirrorHierarchy().getMirrorCompiledID
@@ -475,7 +497,7 @@ class DataMap(object):
                 for key in self.poseDict.keys():
                     if self.poseDict[key]['mirrorID'] and self.poseDict[key]['mirrorID']==mirrorID:
                         matchedPairs.append((key,node))
-                        log.info('poseKey : %s %s >> matched MirrorIndex : %s' % (key, node, self.poseDict[key]['mirrorID']))
+                        log.debug('poseKey : %s %s >> matched MirrorIndex : %s' % (key, node, self.poseDict[key]['mirrorID']))
                         break
         if self.matchMethod=='metaData':
             getMetaDict=self.metaRig.getNodeConnectionMetaDataMap  # optimisation
@@ -486,6 +508,7 @@ class DataMap(object):
                     for key in poseKeys:
                         if poseKeys[key]['metaData']==metaDict:
                             matchedPairs.append((key,node))
+                            log.debug('poseKey : %s %s >> matched MetaData : %s' % (key, node, poseKeys[key]['metaData']))
                             poseKeys.pop(key)
                             break
                 except:
@@ -567,27 +590,32 @@ class DataMap(object):
             is True then use the filter on the destination hierarchy.
         '''
         
-        if not type(nodes)==list:
-            nodes=[nodes]  # cast to list for consistency
-        
-        #push args to object - means that any poseHandler.py file has access to them
+        # push args to object - means that any poseHandler.py file has access to them
         if filepath:
             self.filepath = filepath
-            
+        if not type(nodes)==list:
+            nodes=[nodes]  # cast to list for consistency
         self.useFilter = useFilter  # used in the getNodes call
-        nodesToLoad = self._matchNodes_to_data(nodes)
-        
-        if not self.matchedPairs:
-            raise StandardError('No Matching Nodes found in the PoseFile!')
-        else:
-            if self.prioritySnapOnly:
-                #we've already filtered the hierarchy, may as well just filter the results for speed
-                nodesToLoad=r9Core.prioritizeNodeList(nodesToLoad, self.settings.filterPriority, regex=True, prioritysOnly=True)
-                nodesToLoad.reverse()
+                     
+        try:
+            self._pre_load()
             
-            # nodes now matched, apply the data in the dataMap
-            self._applyData()
-
+            nodesToLoad = self.processPoseFile(nodes)
+            
+            if not self.matchedPairs:
+                raise StandardError('No Matching Nodes found in the PoseFile!')
+            else:
+                if self.prioritySnapOnly:
+                    #we've already filtered the hierarchy, may as well just filter the results for speed
+                    nodesToLoad=r9Core.prioritizeNodeList(nodesToLoad, self.settings.filterPriority, regex=True, prioritysOnly=True)
+                    nodesToLoad.reverse()
+                
+                # nodes now matched, apply the data in the dataMap
+                self._applyData()
+        except StandardError,err:
+            log.info('Pose Load Failed! : , %s' % err)
+        finally:
+            self._post_load()
 
 
 class PoseData(DataMap):
@@ -800,6 +828,7 @@ class PoseData(DataMap):
         :param maintainSpaces: this preserves any parentSwitching mismatches between 
             the stored pose and the current rig settings, current spaces are maintained. 
             This only checks those nodes in the snapList and only runs under relative mode.
+        :param percent: percentage of the pose to apply, used by the poseBlender in the UIs
         '''
         
         if relativePose and not cmds.ls(sl=True):
@@ -820,7 +849,7 @@ class PoseData(DataMap):
         self.maintainSpaces = maintainSpaces
         self.mayaUpAxis = r9Setup.mayaUpAxis()
         
-        nodesToLoad = self._matchNodes_to_data(nodes)
+        nodesToLoad = self.processPoseFile(nodes)
         
         if not self.matchedPairs:
             raise StandardError('No Matching Nodes found in the PoseFile!')
